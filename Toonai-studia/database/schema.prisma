@@ -1,0 +1,292 @@
+// ToonAI Studio — Database Schema
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AuthProvider {
+  EMAIL
+  GOOGLE
+  PHONE
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum JobType {
+  TEXT_TO_VIDEO
+  IMAGE_TO_VIDEO
+  AI_STORY
+}
+
+enum CreditTxnType {
+  WELCOME_BONUS
+  PURCHASE
+  SUBSCRIPTION_GRANT
+  RESERVE
+  DEDUCT
+  REFUND
+  ADMIN_ADJUSTMENT
+  AD_REWARD
+}
+
+enum PurchaseStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum SubscriptionPlan {
+  FREE
+  BASIC
+  CREATOR
+  PRO
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+  PAST_DUE
+}
+
+model User {
+  id              String        @id @default(uuid())
+  email           String?       @unique
+  phone           String?       @unique
+  passwordHash    String?       // bcrypt hash, never plain text
+  authProvider    AuthProvider  @default(EMAIL)
+  googleId        String?       @unique
+  displayName     String?
+  avatarUrl       String?
+  isVerified      Boolean       @default(false)
+  hasReceivedWelcomeCredits Boolean @default(false)
+  isAdmin         Boolean       @default(false)
+  isBanned        Boolean       @default(false)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  creditBalance   CreditBalance?
+  creditLedger    CreditLedgerEntry[]
+  projects        Project[]
+  purchases       Purchase[]
+  subscription    Subscription?
+  reports         ContentReport[]
+  refreshTokens   RefreshToken[]
+
+  @@index([email])
+  @@index([phone])
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash   String   @unique
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Current spendable balance. Kept denormalized for fast reads;
+// source of truth is always recomputed/validated against CreditLedgerEntry in a transaction.
+model CreditBalance {
+  userId      String   @id
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  available   Int      @default(0) // spendable now
+  reserved    Int      @default(0) // held against in-flight jobs
+  updatedAt   DateTime @updatedAt
+}
+
+// Append-only ledger. Every credit movement is recorded here for audit + replay protection.
+model CreditLedgerEntry {
+  id            String        @id @default(uuid())
+  userId        String
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type          CreditTxnType
+  amount        Int           // positive = credit added, negative = credit removed
+  balanceAfter  Int
+  jobId         String?
+  job           GenerationJob? @relation(fields: [jobId], references: [id])
+  purchaseId    String?
+  purchase      Purchase?     @relation(fields: [purchaseId], references: [id])
+  idempotencyKey String?      @unique // prevents double-processing (e.g. duplicate webhook)
+  note          String?
+  createdAt     DateTime      @default(now())
+
+  @@index([userId])
+  @@index([jobId])
+}
+
+model CreditProduct {
+  id            String   @id @default(uuid())
+  sku           String   @unique // e.g. toonai_credits_100
+  label         String
+  credits       Int
+  priceInPaise  Int      // ₹49 = 4900
+  currency      String   @default("INR")
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  purchases     Purchase[]
+}
+
+model SubscriptionProduct {
+  id              String   @id @default(uuid())
+  plan            SubscriptionPlan @unique
+  sku             String?  @unique // e.g. toonai_basic_monthly (Play Billing)
+  monthlyCredits  Int
+  priceInPaise    Int
+  currency        String   @default("INR")
+  isActive        Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+model Subscription {
+  id            String             @id @default(uuid())
+  userId        String             @unique
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan          SubscriptionPlan   @default(FREE)
+  status        SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart DateTime      @default(now())
+  currentPeriodEnd   DateTime?
+  playPurchaseToken  String?       @unique // Google Play subscription token
+  autoRenew     Boolean            @default(false)
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+}
+
+model Purchase {
+  id                String         @id @default(uuid())
+  userId            String
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditProductId   String?
+  creditProduct     CreditProduct? @relation(fields: [creditProductId], references: [id])
+  status            PurchaseStatus @default(PENDING)
+  amountInPaise     Int
+  currency          String         @default("INR")
+  creditsGranted    Int?
+  // Google Play purchase token doubles as the idempotency key —
+  // a duplicate token can never grant credits twice.
+  playPurchaseToken String?        @unique
+  playOrderId       String?
+  rawProviderPayload Json?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  ledgerEntries     CreditLedgerEntry[]
+
+  @@index([userId])
+}
+
+model Project {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title       String
+  status      JobStatus @default(QUEUED)
+  durationSec Int
+  aspectRatio String    // "9:16" | "16:9" | "1:1"
+  style       String
+  thumbnailUrl String?
+  finalVideoUrl String?
+  hasWatermark Boolean  @default(true)
+  isDeleted   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  jobs        GenerationJob[]
+  scenes      Scene[]
+  reports     ContentReport[]
+
+  @@index([userId])
+}
+
+model Scene {
+  id          String   @id @default(uuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  order       Int
+  prompt      String
+  durationSec Int
+  character   String?
+  background  String?
+  camera      String?
+  dialogue    String?
+  voiceId     String?
+  videoUrl    String?
+  status      JobStatus @default(QUEUED)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+model GenerationJob {
+  id              String    @id @default(uuid())
+  projectId       String
+  project         Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId          String
+  type            JobType
+  status          JobStatus @default(QUEUED)
+  creditsReserved Int
+  prompt          String
+  paramsJson      Json      // duration, aspect ratio, style, camera, quality, voice, etc.
+  currentStage    String?   // e.g. "generating_video", "generating_voice", "subtitles", "encoding"
+  errorMessage    String?
+  attempt         Int       @default(1)
+  maxAttempts     Int       @default(2)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  ledgerEntries   CreditLedgerEntry[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model ContentReport {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id])
+  reason      String
+  details     String?
+  resolved    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+}
+
+model AdminSetting {
+  key         String   @id // e.g. "welcome_credits", "credit_cost.5s"
+  value       Json
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?
+}
+
+model AdRewardVerification {
+  id              String   @id @default(uuid())
+  userId          String
+  projectId       String
+  providerTxnId   String   @unique // idempotency: provider's reward callback id
+  verified        Boolean  @default(false)
+  createdAt       DateTime @default(now())
+}
